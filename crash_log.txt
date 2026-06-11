@@ -1,0 +1,22 @@
+Traceback (most recent call last):
+  File "C:\Users\shiva\OneDrive\Documents\8 ball pool\src\eight_ball_analyzer\ui\main_window.py", line 137, in open_video
+    self.read_frame(0)
+    ~~~~~~~~~~~~~~~^^^
+  File "C:\Users\shiva\OneDrive\Documents\8 ball pool\src\eight_ball_analyzer\ui\main_window.py", line 235, in read_frame
+    self.current_analysis = self.analyzer.analyze_frame(frame, frame_index=index, track=True)
+                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\shiva\OneDrive\Documents\8 ball pool\src\eight_ball_analyzer\analysis.py", line 119, in analyze_frame
+    analysis.shot = predict_shot(cue_ball, object_ball, pocket, balls, table, ball_radius_px)
+                    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\shiva\OneDrive\Documents\8 ball pool\src\eight_ball_analyzer\geometry.py", line 270, in predict_shot
+    cue_after_impact = predict_cue_after_impact(
+        cue_ball, object_ball, ghost_center,
+        table.bounds if table is not None else None,
+        max_bounces=3,
+    )
+  File "C:\Users\shiva\OneDrive\Documents\8 ball pool\src\eight_ball_analyzer\geometry.py", line 675, in predict_cue_after_impact
+    return trace_path_with_reflections(impact_center, cue_deflection, cue_ball.radius, table, max_bounces)
+  File "C:\Users\shiva\OneDrive\Documents\8 ball pool\src\eight_ball_analyzer\geometry.py", line 646, in trace_path_with_reflections
+    wall_t, wall_point, wall_normal = _ray_to_table_rails(pos, vel, table.rails, radius)
+                                                                    ^^^^^^^^^^^
+AttributeError: 'tuple' object has no attribute 'rails'
