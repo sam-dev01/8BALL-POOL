@@ -59,6 +59,6 @@ class VideoWidget(QLabel):
         pixmap = QPixmap.fromImage(qimage).scaled(
             self.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation,
         )
         self.setPixmap(pixmap)

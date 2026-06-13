@@ -259,6 +259,8 @@ class ChromeWebCapture:
             if area < frame_area * 0.025:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
+            if w < frame_bgr.shape[1] * 0.40 or h < frame_bgr.shape[0] * 0.40:
+                continue
             aspect = w / max(h, 1)
             if not (1.35 <= aspect <= 3.8):
                 continue
