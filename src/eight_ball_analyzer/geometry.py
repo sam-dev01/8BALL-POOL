@@ -101,43 +101,6 @@ def reflect_vector(direction: np.ndarray, normal: np.ndarray) -> np.ndarray:
     return reflected / max(rlen, 1e-6)
 
 
-def _ray_to_rail_in_normalised(
-    pos: np.ndarray,
-    direction: np.ndarray,
-    rails: list[Rail],
-    M: np.ndarray,
-    ball_radius_n: float,
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """Find the nearest rail intersection in normalised space.
-
-    Returns (t, contact_point, inward_normal).
-    """
-    best_t = 1e9
-    best_pt = pos + direction * 1e9
-    best_normal = direction.copy()
-
-    for rail in rails:
-        s_n, e_n, n = _rail_in_normalised(rail, M)
-        # Offset the rail inward by ball_radius_n
-        rail_origin = s_n + n * ball_radius_n
-        rail_dir    = e_n - s_n
-
-        denom = float(np.cross(direction, rail_dir))
-        if abs(denom) < 1e-8:
-            continue
-        diff = rail_origin - pos
-        t = float(np.cross(diff, rail_dir)) / denom
-        u = float(np.cross(diff, direction)) / denom
-        if t <= 1e-4 or u < 0 or u > 1.0:
-            continue
-        if t < best_t:
-            best_t = t
-            best_pt = pos + direction * t
-            best_normal = n
-
-    return best_t, best_pt, best_normal
-
-
 # ---------------------------------------------------------------------------
 # Core physics — ghost ball
 # ---------------------------------------------------------------------------
@@ -244,8 +207,22 @@ def predict_shot(
                 object_ball.center, pocket.center, avg_radius, table.bounds
             )
         if len(bank_candidate) == 3:
-            object_path = bank_candidate
-            aim_target  = bank_candidate[1]
+            # BUG 3 FIX: only switch to the bank path if its first leg is
+            # itself unobstructed. Previously a blocked bank leg could still
+            # be returned as the chosen path because find_blockers was only
+            # evaluated on the original direct path.
+            bank_first_leg_blocked = False
+            for ball in all_balls:
+                if ball.id == object_ball.id:
+                    continue
+                if _point_near_segment(
+                    ball.center, bank_candidate[0], bank_candidate[1], avg_radius * 1.7
+                ):
+                    bank_first_leg_blocked = True
+                    break
+            if not bank_first_leg_blocked:
+                object_path = bank_candidate
+                aim_target  = bank_candidate[1]
 
     ghost_center    = ghost_ball_for_target(object_ball, aim_target, avg_radius)
     cue_distance    = distance(cue_ball.center, ghost_center)
@@ -343,22 +320,31 @@ def recommend_best_shot(
     ball_radius_px: float = 14.0,
 ) -> tuple[BallDetection | None, Pocket | None]:
     """Finds the absolute best valid object ball and pocket combination."""
-    best_score = float('inf')
-    best_target = None
-    best_pocket = None
-    
     from .models import BallKind
-    candidates = [b for b in balls if b.id != cue_ball.id and b.kind in {BallKind.SOLID, BallKind.STRIPE, BallKind.EIGHT}]
-    
+
+    best_score = float('inf')
+    best_target: BallDetection | None = None
+    best_pocket: Pocket | None = None
+
+    candidates = [
+        b for b in balls
+        if b.id != cue_ball.id
+        and b.kind in {BallKind.SOLID, BallKind.STRIPE, BallKind.EIGHT}
+    ]
+
+    # BUG 2 FIX: score every (ball, pocket) pair exactly once. The previous
+    # implementation called recommend_pocket (which scores every pocket) and
+    # then re-scored the chosen pocket again, doing 7x the work per frame.
     for ball in candidates:
-        pocket = recommend_pocket(cue_ball, ball, pockets, balls, table, ball_radius_px)
-        if pocket is not None:
+        for pocket in pockets:
             score = shot_score(cue_ball, ball, pocket, balls, table, ball_radius_px)
-            if score is not None and score < best_score:
+            if score is None:
+                continue
+            if score < best_score:
                 best_score = score
                 best_target = ball
                 best_pocket = pocket
-                
+
     return best_target, best_pocket
 
 
@@ -404,30 +390,6 @@ def shot_score(
                 
     # Impossible shot (both direct and bank are physically obstructed or invalid cut angle)
     return None
-
-
-def _best_one_rail_bank_score(
-    object_ball: BallDetection,
-    pocket: Pocket,
-    table: Optional[TableDetection],
-    direct_distance: float,
-    ball_radius_px: float,
-) -> float | None:
-    if table is None:
-        return None
-    use_normalised = (
-        table.transform_matrix is not None and table.inv_transform_matrix is not None
-    )
-    if use_normalised:
-        path = best_one_rail_bank_path_normalised(object_ball, pocket, ball_radius_px, table)
-    else:
-        path = best_one_rail_bank_path_image(object_ball.center, pocket.center, ball_radius_px, table.bounds)
-    if len(path) < 3:
-        return None
-    bank_distance = sum(distance(path[i], path[i + 1]) for i in range(len(path) - 1))
-    if bank_distance > direct_distance * 1.8:
-        return None
-    return min(100.0, bank_distance / 1400.0 * 100.0 + 18.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1000,71 +962,6 @@ def success_probability(difficulty: float) -> float:
 # ---------------------------------------------------------------------------
 # Private low-level helpers
 # ---------------------------------------------------------------------------
-
-def _ray_ball_intersect(
-    origin: np.ndarray,
-    direction: np.ndarray,
-    ball: BallDetection,
-    collision_radius: float,
-) -> float | None:
-    hit = _first_ball_on_ray(origin, direction, [ball], collision_radius, 1e9)
-    return hit[1] if hit is not None else None
-
-
-def _trace_ball_path_until_hit(
-    start: np.ndarray,
-    direction: np.ndarray,
-    radius: float,
-    table: TableDetection,
-    pockets: list[Pocket],
-    balls: list[BallDetection],
-    ignore_ids: set[int],
-    max_bounces: int = 3,
-) -> tuple[list[np.ndarray], BallDetection | None]:
-    direction = direction / max(float(np.linalg.norm(direction)), 1e-6)
-    pos  = start.astype(float).copy()
-    path: list[np.ndarray] = [pos.copy()]
-    remaining = [b for b in balls if b.id not in ignore_ids]
-
-    for _ in range(max_bounces + 1):
-        ctype, hit_point, dist, obj, normal = _find_first_collision(
-            pos, direction, remaining, table.rails, pockets, radius
-        )
-        if ctype == "NONE" or ctype == "POCKET":
-            if ctype == "POCKET":
-                path.append(hit_point.astype(float))
-            break
-        elif ctype == "BALL":
-            path.append(hit_point.astype(float))
-            return path, obj
-        elif ctype == "RAIL":
-            path.append(hit_point.astype(float))
-            direction = reflect_vector(direction, normal)
-            pos = hit_point + direction * max(1.5, radius * 0.15)
-
-    return path, None
-
-
-def _first_ball_on_ray(
-    pos: np.ndarray,
-    direction: np.ndarray,
-    balls: list[BallDetection],
-    collision_radius: float,
-    max_t: float,
-) -> tuple[BallDetection, float] | None:
-    best: tuple[BallDetection, float] | None = None
-    for ball in balls:
-        to_ball = ball.center.astype(float) - pos
-        t = float(np.dot(to_ball, direction))
-        if t <= 0 or t >= max_t:
-            continue
-        closest = pos + direction * t
-        miss    = distance(closest, ball.center)
-        allowed = max(collision_radius, ball.radius * 1.8)
-        if miss <= allowed and (best is None or t < best[1]):
-            best = (ball, t)
-    return best
-
 
 def _point_near_segment(
     point: np.ndarray,

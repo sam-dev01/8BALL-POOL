@@ -184,7 +184,6 @@ class VideoAnalyzer:
             cue_ball, balls, pockets, table, guide, ball_radius_px, is_aim_mode
         )
         if object_ball is not None and pocket is not None and cue_ball is not None:
-            from .geometry import predict_shot
             analysis.shot = predict_shot(
                 cue_ball, object_ball, pocket, balls, table, ball_radius_px
             )

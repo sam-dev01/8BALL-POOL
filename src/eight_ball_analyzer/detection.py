@@ -181,12 +181,17 @@ class PoolDetector:
                     continue
             if not is_likely_cue and self._looks_like_table_marking(roi, cx, cy, radius, cloth_color):
                 continue
+            kind = classify_ball(color)
+            # BUG 5 FIX: upgrade SOLID → STRIPE when the patch contains both
+            # a bright white band and a saturated colored region.
+            if kind == BallKind.SOLID and self._patch_has_white_band(frame, fx, fy, int(radius)):
+                kind = BallKind.STRIPE
             balls.append(
                 BallDetection(
                     id=idx,
                     center=np.array([float(fx), float(fy)]),
                     radius=float(radius),
-                    kind=classify_ball(color),
+                    kind=kind,
                     confidence=confidence,
                     color_bgr=color,
                 )
@@ -775,6 +780,38 @@ class PoolDetector:
         mean = patch.reshape(-1, 3).mean(axis=0)
         return tuple(int(v) for v in mean)
 
+    def _patch_has_white_band(self, frame, cx, cy, radius) -> bool:
+        """Return True if the ball patch contains both a bright/white region
+        and a saturated colored region — the signature of a striped ball.
+
+        BUG 5 FIX: classify_ball alone could not distinguish solids from
+        stripes because a single mean color collapses the white band into the
+        body color. Sampling per-pixel saturation/value lets us detect the
+        white band directly.
+        """
+        y0 = max(0, cy - radius)
+        y1 = min(frame.shape[0], cy + radius + 1)
+        x0 = max(0, cx - radius)
+        x1 = min(frame.shape[1], cx + radius + 1)
+        patch = frame[y0:y1, x0:x1]
+        if patch.size == 0 or radius < 4:
+            return False
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        s = hsv[..., 1]
+        v = hsv[..., 2]
+        # Mask the inscribed disk so the cloth/edges don't pollute the stats.
+        h_p, w_p = patch.shape[:2]
+        yy, xx = np.ogrid[:h_p, :w_p]
+        cy_p, cx_p = h_p / 2.0, w_p / 2.0
+        disk = (yy - cy_p) ** 2 + (xx - cx_p) ** 2 <= (radius * 0.85) ** 2
+        if not np.any(disk):
+            return False
+        s_in = s[disk]
+        v_in = v[disk]
+        white_ratio = float(np.mean((s_in < 55) & (v_in > 175)))
+        color_ratio = float(np.mean((s_in > 110) & (v_in > 80)))
+        return white_ratio > 0.18 and color_ratio > 0.18
+
     def _circle_quality(self, gray, cx, cy, radius):
         h, w = gray.shape[:2]
         if cx - radius < 0 or cy - radius < 0 or cx + radius >= w or cy + radius >= h:
@@ -924,5 +961,3 @@ def classify_ball(color_bgr: tuple[int, int, int]) -> BallKind:
         return BallKind.SOLID       # 4-ball or 12-ball
     else:  # Magenta / pink
         return BallKind.STRIPE
-
-    return BallKind.SOLID

@@ -136,7 +136,11 @@ class BallTracker:
         for track_id in range(self.max_tracks):
             if track_id not in self._tracks:
                 return track_id
-        return min(self._tracks, key=lambda track_id: len(self._history.get(track_id, [])))
+        # BUG 11 FIX: when the tracker is full, evict the shortest-history
+        # track explicitly so its state is not silently overwritten in place.
+        victim = min(self._tracks, key=lambda track_id: len(self._history.get(track_id, [])))
+        self._drop_track(victim)
+        return victim
 
     def register_single(self, detection: BallDetection) -> int:
         best_id = None
