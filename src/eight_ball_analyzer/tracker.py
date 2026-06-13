@@ -11,6 +11,7 @@ class BallTracker:
     def __init__(self, max_distance: float = 55.0, max_tracks: int = 16) -> None:
         self.max_distance = max_distance
         self.max_tracks = max_tracks
+        self.max_missing = 15
         self._tracks: dict[int, np.ndarray] = {}
         self._velocities: dict[int, np.ndarray] = {}
         self._history: dict[int, list[np.ndarray]] = {}
@@ -18,6 +19,7 @@ class BallTracker:
         self._radii: dict[int, float] = {}
         self._colors: dict[int, tuple[int, int, int]] = {}
         self._confidences: dict[int, float] = {}
+        self._missed_frames: dict[int, int] = {}
 
     def reset(self) -> None:
         self._tracks.clear()
@@ -27,6 +29,7 @@ class BallTracker:
         self._radii.clear()
         self._colors.clear()
         self._confidences.clear()
+        self._missed_frames.clear()
 
     def assign(self, detections: list[BallDetection]) -> list[BallDetection]:
         detections = detections[: self.max_tracks]
@@ -67,12 +70,40 @@ class BallTracker:
                 self._history.setdefault(best_id, []).append(detection.center.copy())
                 self._history[best_id] = self._history[best_id][-20:]
                 self._kinds[best_id] = detection.kind
-                self._radii[best_id] = detection.radius
+                # IMPROVEMENT D: EMA radius smoothing — prevents radius jitter between frames
+                stored_r = self._radii.get(best_id, detection.radius)
+                self._radii[best_id] = 0.8 * stored_r + 0.2 * detection.radius
+                detection.radius = self._radii[best_id]
                 self._colors[best_id] = detection.color_bgr
                 self._confidences[best_id] = detection.confidence
+                self._missed_frames[best_id] = 0
                 unmatched_tracks.remove(best_id)
+
+                
         for track_id in unmatched_tracks:
-            self._drop_track(track_id)
+            self._missed_frames[track_id] = self._missed_frames.get(track_id, 0) + 1
+            if self._missed_frames[track_id] >= self.max_missing:
+                self._drop_track(track_id)
+            else:
+                vel = self._velocities.get(track_id, np.zeros(2))
+                if np.linalg.norm(vel) < 3.0:
+                    vel = np.zeros(2)
+                else:
+                    vel = vel * 0.8
+                self._velocities[track_id] = vel
+                last_pos = self._tracks[track_id] + vel
+                self._tracks[track_id] = last_pos.copy()
+                self._history.setdefault(track_id, []).append(last_pos.copy())
+                missing_det = BallDetection(
+                    id=track_id,
+                    center=last_pos,
+                    radius=self._radii.get(track_id, 10.0),
+                    kind=self._kinds.get(track_id, BallKind.UNKNOWN),
+                    confidence=self._confidences.get(track_id, 0.5),
+                    color_bgr=self._colors.get(track_id, (0, 0, 0))
+                )
+                detections.append(missing_det)
+                
         return detections
 
     def _start_track(self, track_id: int, detection: BallDetection) -> None:
@@ -83,6 +114,7 @@ class BallTracker:
         self._radii[track_id] = detection.radius
         self._colors[track_id] = detection.color_bgr
         self._confidences[track_id] = detection.confidence
+        self._missed_frames[track_id] = 0
 
     def _drop_track(self, track_id: int) -> None:
         self._tracks.pop(track_id, None)
@@ -92,6 +124,7 @@ class BallTracker:
         self._radii.pop(track_id, None)
         self._colors.pop(track_id, None)
         self._confidences.pop(track_id, None)
+        self._missed_frames.pop(track_id, None)
 
     def get_speed(self, track_id: int) -> float:
         velocity = self._velocities.get(track_id)
@@ -104,3 +137,29 @@ class BallTracker:
             if track_id not in self._tracks:
                 return track_id
         return min(self._tracks, key=lambda track_id: len(self._history.get(track_id, [])))
+
+    def register_single(self, detection: BallDetection) -> int:
+        best_id = None
+        best_distance = self.max_distance
+        for track_id, pos in self._tracks.items():
+            dist = float(np.linalg.norm(detection.center - pos))
+            if dist < best_distance:
+                best_id = track_id
+                best_distance = dist
+        
+        if best_id is None:
+            best_id = self._next_free_id()
+            self._start_track(best_id, detection)
+        else:
+            previous = self._tracks[best_id].copy()
+            self._tracks[best_id] = detection.center.copy()
+            self._velocities[best_id] = detection.center.astype(float) - previous.astype(float)
+            self._history.setdefault(best_id, []).append(detection.center.copy())
+            self._history[best_id] = self._history[best_id][-20:]
+            self._kinds[best_id] = detection.kind
+            self._radii[best_id] = detection.radius
+            self._colors[best_id] = detection.color_bgr
+            self._confidences[best_id] = detection.confidence
+            self._missed_frames[best_id] = 0
+            
+        return best_id

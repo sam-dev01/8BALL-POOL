@@ -60,10 +60,10 @@ Launch 8 Ball Analyzer.bat
 
 ## Basic Workflow
 
-1. Click **Open Video** and choose a recorded practice video.
-2. Use **Play**, the timeline, or **Analyze Current Frame** to inspect a frame.
-3. The analyzer finds the active target from the cue ray and recommends the best pocket.
-4. Review the ghost ball, predicted paths, blockers, difficulty, and recommended power.
+1. For live web capture, open `https://8ballpool.com/game` in Chrome/Edge and keep that tab visible.
+2. Click **Start Live Capture**. Leave **Auto Table Lock** enabled so the app crops/calibrates the table automatically.
+3. For recorded practice, click **Open Video** and choose a saved video.
+4. Use **Play**, the timeline, or **Analyze Current Frame** to inspect a frame.
 5. Export an overlay video, PNG frame, or JSON report.
 
 ## YOLO Model

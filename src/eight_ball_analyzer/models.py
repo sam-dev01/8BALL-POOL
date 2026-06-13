@@ -16,6 +16,13 @@ class BallKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+class GameState(str, Enum):
+    READY = "ready"
+    AIMING = "aiming"
+    SHOT_IN_PROGRESS = "shot_in_progress"
+    TABLE_SETTLING = "table_settling"
+
+
 @dataclass(slots=True)
 class BallDetection:
     id: int
@@ -129,7 +136,14 @@ class AimGuide:
     cue_path: list[np.ndarray] = field(default_factory=list)
     first_hit_ball_id: Optional[int] = None
     first_hit_point: Optional[np.ndarray] = None
-    object_path: list[np.ndarray] = field(default_factory=list)
+    physical_contact_point: Optional[np.ndarray] = None
+    
+    # Trajectory Visualization
+    object_path: list[np.ndarray] = field(default_factory=list)             # Green
+    object_reflection_path: list[np.ndarray] = field(default_factory=list)  # Yellow
+    secondary_ball_id: Optional[int] = None
+    secondary_path: list[np.ndarray] = field(default_factory=list)          # Orange
+    
     collision_paths: list[BallPath] = field(default_factory=list)
     cue_deflection_path: list[np.ndarray] = field(default_factory=list)
     shot_speed: float = 0.0
@@ -138,12 +152,25 @@ class AimGuide:
 
 
 @dataclass(slots=True)
+class VisualizerConfig:
+    max_bounces: int = 3
+    show_cue_path: bool = True
+    show_reflection_path: bool = True
+    show_collision: bool = True
+    show_object_path: bool = True
+    show_deflection: bool = True
+    trick_shot_mode: bool = False
+
+
+@dataclass(slots=True)
 class FrameAnalysis:
     frame_index: int
     table: Optional[TableDetection]
     balls: list[BallDetection]
     pockets: list[Pocket]
+    state: GameState = GameState.READY
     ball_radius_px: float = 0.0          # calibrated from detected balls this frame
     operating_mode: str = "Analysis Mode"
     shot: ShotPrediction = field(default_factory=ShotPrediction)
     guide: AimGuide = field(default_factory=AimGuide)
+    config: VisualizerConfig = field(default_factory=VisualizerConfig)

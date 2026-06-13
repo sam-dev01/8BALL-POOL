@@ -96,59 +96,50 @@ def draw_overlay(frame: np.ndarray, analysis: FrameAnalysis | None) -> np.ndarra
     # 4.  SHOT TRAJECTORIES                                               #
     # ------------------------------------------------------------------ #
     has_guide_path = len(guide.cue_path) >= 2
-    has_shot = shot.valid and (
-        _shot_is_on_table(analysis)
-        or (shot.ghost_ball_center is not None and shot.object_ball_id is not None)
-    )
+    config = analysis.config
 
-    # 4a. Extended cue path (yellow — Cheto-style)
+    # 4a. Extended cue path (White)
     if has_guide_path:
-        _draw_poly_path(output, guide.cue_path, (0, 210, 255), 3)
-    elif has_shot and shot.cue_to_ghost is not None:
-        start, end = shot.cue_to_ghost
-        cv2.arrowedLine(output, _pt(start), _pt(end),
-                        (0, 210, 255), 3, cv2.LINE_AA, tipLength=0.05)
+        if config.show_cue_path:
+            _draw_poly_path(output, guide.cue_path, (255, 255, 255), 3)
 
-    # 4a2. Cue deflection after impact (light blue)
-    if len(guide.cue_deflection_path) >= 2:
-        _draw_poly_path(output, guide.cue_deflection_path, (255, 180, 120), 2)
-
-    # 4b. Ghost ball contact point
-    if has_shot and shot.ghost_ball_center is not None:
-        ghost_pt = _pt(shot.ghost_ball_center)
-        ghost_r  = int(analysis.ball_radius_px) if analysis.ball_radius_px > 4 else 14
-        target_ball = None
-        if shot.object_ball_id is not None:
-            target_ball = next((b for b in analysis.balls if b.id == shot.object_ball_id), None)
-            if target_ball is not None:
-                ghost_r = max(10, int(target_ball.radius))
-        cv2.circle(output, ghost_pt, ghost_r, (150, 150, 0), 2, cv2.LINE_AA)
-        cv2.circle(output, ghost_pt, 2, (150, 150, 0), -1, cv2.LINE_AA)
+    # 4b. Debug Collision Geometry
+    if config.show_collision and guide.first_hit_point is not None and guide.first_hit_ball_id is not None:
+        target_ball = next((b for b in analysis.balls if b.id == guide.first_hit_ball_id), None)
+        cue_ball = next((b for b in analysis.balls if b.kind == BallKind.CUE), None)
         
-        # Ghost -> Target path
-        if target_ball is not None:
-            cv2.arrowedLine(output, ghost_pt, _pt(target_ball.center),
-                            (150, 150, 0), 3, cv2.LINE_AA, tipLength=0.05)
+        if target_ball is not None and cue_ball is not None:
+            # White circle = Cue Ball Center
+            cv2.circle(output, _pt(cue_ball.center), 4, (255, 255, 255), -1, cv2.LINE_AA)
+            # Yellow circle = Object Ball Center
+            cv2.circle(output, _pt(target_ball.center), 4, (0, 255, 255), -1, cv2.LINE_AA)
+            # Blue circle = Ghost Ball Center
+            cv2.circle(output, _pt(guide.first_hit_point), 4, (255, 0, 0), -1, cv2.LINE_AA)
+            
+            # Red dot = Calculated Collision Point
+            if guide.physical_contact_point is not None:
+                cv2.circle(output, _pt(guide.physical_contact_point), 4, (0, 0, 255), -1, cv2.LINE_AA)
 
-    # 4c. Chained ball paths (green → gold → cyan for 2nd/3rd ball hits)
-    if guide.collision_paths:
-        chain_colors = [(0, 255, 80), (0, 200, 255), (255, 220, 0), (255, 120, 255)]
-        for index, ball_path in enumerate(guide.collision_paths):
-            if len(ball_path.path) < 2:
-                continue
-            color = chain_colors[min(index, len(chain_colors) - 1)]
-            _draw_poly_path(output, ball_path.path, color, 3 if index == 0 else 2)
-    elif has_shot and shot.bank_path:
-        _draw_poly_path(output, shot.bank_path, (0, 255, 80), 3)
-    elif guide.object_path:
-        _draw_poly_path(output, guide.object_path, (0, 255, 80), 3)
-
-    # 4d. Recommended pocket highlight (removed circular highlight, only text if needed)
+    # 4c. Object Trajectory (Green)
+    if config.show_object_path and len(guide.object_path) >= 2:
+        _draw_poly_path(output, guide.object_path, (0, 255, 0), 2)
+        
+    # 4d. Reflections (Yellow)
+    if config.show_reflection_path and len(guide.object_reflection_path) >= 2:
+        _draw_poly_path(output, guide.object_reflection_path, (0, 255, 255), 2)
+        
+    # 4e. Secondary Trajectory (Orange)
+    if len(guide.secondary_path) >= 2:
+        _draw_poly_path(output, guide.secondary_path, (0, 165, 255), 2)
+        
+    # 4f. Cue Deflection Trajectory (Purple)
+    if config.show_deflection and len(guide.cue_deflection_path) >= 2:
+        _draw_poly_path(output, guide.cue_deflection_path, (255, 0, 255), 2)
 
     # ------------------------------------------------------------------ #
     # 5.  HUD + POWER BAR
     _draw_hud(output, shot, guide, analysis)
-    _draw_power(output, shot.recommended_power or guide.power or guide.shot_speed)
+    _draw_power(output, shot.recommended_power or guide.power or guide.shot_speed, analysis)
     return output
 
 
@@ -161,13 +152,21 @@ def _draw_table_geometry(
     table: TableDetection,
     analysis: FrameAnalysis,
 ) -> None:
-    """Draw minimal table status badge (all chaotic geometric lines removed)."""
-    # --- Table status badge (top-right of table area) ---
+    """Draw minimal table status badge and debugging overlays."""
+    # Table status badge (top-right of table area)
     tx, ty, tw, th = table.bounds
     status = f"W:{table.width_px:.0f} H:{table.height_px:.0f}  conf:{table.confidence:.2f}"
     cv2.putText(output, status,
                 (tx + 4, ty - 6 if ty > 14 else ty + 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 220, 100), 1, cv2.LINE_AA)
+
+    # BUG 9 FIX: Remove always-on red debug rectangle (coordinate bugs are now fixed).
+    # Only draw the calibrated polygon outline for visual reference.
+    if table.polygon is not None and len(table.polygon) > 0:
+        pts = np.array(table.polygon, np.int32).reshape((-1, 1, 2))
+        cv2.polylines(output, [pts], True, (0, 180, 60), 1, cv2.LINE_AA)
+
+
 
 
 def _draw_perspective_grid(
@@ -252,42 +251,61 @@ def _draw_poly_path(
 
 
 def _draw_hud(output: np.ndarray, shot, guide, analysis: FrameAnalysis) -> None:
-    """Draw the stats box in the top-left corner, including table geometry info."""
-    difficulty_color = _difficulty_color(shot.difficulty)
-    box_x2 = _HUD_X + _HUD_W
+    """Draw the stats box BELOW the pool table so it never obscures the playing surface."""
     hit_label   = f"ball {guide.first_hit_ball_id}" if guide.first_hit_ball_id is not None else "--"
     chain_count = len(guide.collision_paths)
-    mode_color = (255, 120, 0) if "Extended" in analysis.operating_mode else (0, 255, 0)
+    trick_shot_status = "ON" if analysis.config.trick_shot_mode else "OFF"
 
     if analysis.table is not None:
-        table_line = f"Table: {analysis.table.width_px:.0f}x{analysis.table.height_px:.0f} (conf: {analysis.table.confidence:.2f})"
+        tx, ty, tw, th = analysis.table.bounds
+        table_line = f"Table: {analysis.table.width_px:.0f}x{analysis.table.height_px:.0f}"
+        # Anchor text BELOW the table
+        base_x = tx
+        base_y = ty + th + 18   # 18px below the table bottom edge
     else:
         table_line = "Table: Not detected"
+        base_x, base_y = 10, output.shape[0] - 120
 
-    r_px = analysis.ball_radius_px
+    # Clamp so text stays inside the image
+    img_h = output.shape[0]
+    if base_y + 120 > img_h:
+        # Not enough room below table — draw above the table instead
+        base_y = max(14, ty - 10) if analysis.table is not None else 14
 
     lines = [
-        (f"Mode: {analysis.operating_mode}",                              mode_color,      0.65, 2),
-        (table_line,                                                      (80, 200, 255),  0.50, 1),
-        (f"Ball radius: {r_px:.1f}px",                                    (160, 160, 160), 0.50, 1),
-        (f"Pocket: {shot.pocket_label}",                                  (210, 180, 255), 0.58, 1),
-        (f"Hit: {hit_label}",                                             (255, 220, 120), 0.58, 1),
-        (f"Success: {shot.success_probability:.0f}%",                     (80,  255, 80),  0.58, 1),
-        (f"Difficulty: {shot.difficulty:.0f}/100  {shot.difficulty_label}", difficulty_color, 0.65, 2),
-        (f"Power: {shot.recommended_power:.0f}%  ({shot.power_label})",   (0,  180, 255),  0.60, 1),
-        (f"Speed: {guide.shot_speed:.0f}px",                              (0,  180, 255),  0.55, 1),
-        (f"Angle: {shot.cut_angle:.1f} deg",                              (230, 230, 230), 0.55, 1),
-        (f"Chain: {chain_count} ball path(s)",                         (230, 230, 230), 0.55, 1),
+        (f"State: {analysis.state.name}  |  {table_line}  |  Hit: {hit_label}",
+         (0, 230, 255), 0.45, 1),
+        (f"Mode: Trajectory Visualizer  |  Trick: {trick_shot_status}  |  Speed: {guide.shot_speed:.0f}px",
+         (0, 200, 120), 0.45, 1),
+        (u"W=Cue  Y=Reflect  G=Object  O=Secondary  \u25cf=Collision",
+         (200, 200, 200), 0.40, 1),
     ]
+
+    line_h = 16
     for i, (text, color, scale, thickness) in enumerate(lines):
-        cv2.putText(output, text, (_HUD_X, _HUD_Y + _LINE_H * (i + 1)),
-                    cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+        y = base_y + i * line_h
+        if 0 <= y < img_h:
+            # Subtle dark shadow for readability
+            cv2.putText(output, text, (base_x + 1, y + 1),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 1)
+            cv2.putText(output, text, (base_x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
 
 
-def _draw_power(output: np.ndarray, power: float) -> None:
-    x0 = _PWR_X
-    y0 = _HUD_Y + _LINE_H * 11 + 18
-    h  = _PWR_BAR_H
+
+
+def _draw_power(output: np.ndarray, power: float, analysis: FrameAnalysis) -> None:
+    if analysis.table is not None:
+        tx, ty, tw, th = analysis.table.bounds
+        x0 = max(10, tx - 30)
+        y0 = ty + 10
+    else:
+        x0 = 10
+        y0 = 60
+
+    h  = min(150, int(output.shape[0] * 0.4))
+    _PWR_BAR_W = 12
+    
     cv2.rectangle(output, (x0, y0), (x0 + _PWR_BAR_W, y0 + h), (60, 60, 60), -1)
     cv2.rectangle(output, (x0, y0), (x0 + _PWR_BAR_W, y0 + h), (230, 230, 230), 1)
     fill_h = int(h * float(np.clip(power, 0.0, 100.0)) / 100.0)

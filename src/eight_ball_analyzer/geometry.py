@@ -599,32 +599,125 @@ def best_one_rail_bank_path_image(
 # Cue-path tracing
 # ---------------------------------------------------------------------------
 
+def _find_first_collision(
+    pos: np.ndarray,
+    direction: np.ndarray,
+    balls: list[BallDetection],
+    rails: list[Rail],
+    pockets: list[Pocket],
+    radius: float,
+) -> tuple[str, np.ndarray, float, any, np.ndarray]:
+    best_t = 1e9
+    best_hit = ("NONE", pos, 1e9, None, np.zeros(2))
+
+    # 1. Balls
+    for ball in balls:
+        C = ball.center.astype(float)
+        V = pos - C
+        # BUG 4 FIX: ghost-ball collision distance = sum of both radii, not max()
+        effective_r = radius + ball.radius
+        b = 2.0 * float(np.dot(V, direction))
+        c = float(np.dot(V, V)) - effective_r ** 2
+        discriminant = b*b - 4*c
+        if discriminant >= 0:
+            sqrt_d = math.sqrt(discriminant)
+            t1 = (-b - sqrt_d) / 2.0
+            t2 = (-b + sqrt_d) / 2.0
+            t = None
+            if c < 0:
+                if b < 0:
+                    t = 1e-4
+            else:
+                if t1 > 1e-4:
+                    t = t1
+                elif t2 > 1e-4:
+                    t = t2
+                    
+            if t is not None and t < best_t:
+                hit_pt = pos + direction * t
+                normal = unit_vector(C, hit_pt) 
+                best_t = t
+                best_hit = ("BALL", hit_pt, t, ball, normal)
+
+    # 2. Rails
+    for rail in rails:
+        r_dir = rail.end - rail.start
+        r_len = float(np.linalg.norm(r_dir))
+        if r_len < 1e-6: continue
+        r_dir /= r_len
+        r_start = rail.start + rail.normal * radius - r_dir * (radius * 1.5)
+        r_end   = rail.end   + rail.normal * radius + r_dir * (radius * 1.5)
+        
+        intersect = _ray_segment_intersect(pos, direction, r_start, r_end)
+        if intersect is not None:
+            t = float(np.dot(intersect - pos, direction))
+            if 1e-4 < t < best_t:
+                best_t = t
+                best_hit = ("RAIL", intersect, t, rail, rail.normal)
+
+    # 3. Pockets
+    for pocket in pockets:
+        C = pocket.center.astype(float)
+        V = pos - C
+        pr = pocket.mouth_radius
+        b = 2.0 * float(np.dot(V, direction))
+        c = float(np.dot(V, V)) - pr ** 2
+        discriminant = b*b - 4*c
+        if discriminant >= 0:
+            sqrt_d = math.sqrt(discriminant)
+            t1 = (-b - sqrt_d) / 2.0
+            t2 = (-b + sqrt_d) / 2.0
+            t = None
+            if t1 > 1e-4: t = t1
+            elif t2 > 1e-4: t = t2
+            if t is not None and t < best_t:
+                hit_pt = pos + direction * t
+                best_t = t
+                best_hit = ("POCKET", hit_pt, t, pocket, np.zeros(2))
+
+    return best_hit
+
+
 def trace_cue_path(
     start: np.ndarray,
     direction: np.ndarray,
     radius: float,
     table: TableDetection,
+    pockets: list[Pocket],
     balls: list[BallDetection],
     max_bounces: int,
-) -> tuple[list[np.ndarray], Optional[BallDetection], Optional[np.ndarray], np.ndarray]:
+) -> tuple[list[np.ndarray], Optional[BallDetection], Optional[np.ndarray], np.ndarray, list[dict]]:
     path = [start.copy()]
     pos  = start.copy()
     vel  = direction.copy()
+    debug_markers = []
 
-    for _ in range(max_bounces + 1):
-        wall_t, wall_point, wall_normal = _ray_to_table_rails(pos, vel, table.rails, radius)
-        ball_hit = _first_ball_on_ray(pos, vel, balls, radius * 2.0, wall_t)
-        if ball_hit is not None:
-            ball, hit_t = ball_hit
-            hit_point = pos + vel * hit_t
-            path.append(hit_point)
-            return path, ball, hit_point, vel
+    for i in range(max_bounces + 1):
+        ctype, hit_point, dist, obj, normal = _find_first_collision(
+            pos, vel, balls, table.rails, pockets, radius
+        )
+        
+        if ctype == "NONE":
+            break
+            
+        path.append(hit_point)
+        
+        if i == 0:
+            debug_markers.append({
+                "point": hit_point,
+                "type": ctype,
+                "distance": dist
+            })
 
-        path.append(wall_point)
-        vel = reflect_vector(vel, wall_normal)
-        pos = wall_point + vel * 1.5
+        if ctype == "BALL":
+            return path, obj, hit_point, vel, debug_markers
+        elif ctype == "POCKET":
+            return path, None, hit_point, vel, debug_markers
+        elif ctype == "RAIL":
+            vel = reflect_vector(vel, normal)
+            pos = hit_point + vel * 1.5
 
-    return path, None, None, vel
+    return path, None, None, vel, debug_markers
 
 
 def trace_path_with_reflections(
@@ -714,8 +807,11 @@ def trace_ball_collision_chain(
     table: TableDetection,
     cue_direction: np.ndarray,
     power: float,
-    max_chain_depth: int = 3,
+    pockets: list[Pocket],
+    max_chain_depth: int = 2,
     ball_radius_px: float = 14.0,
+    max_bounces: int = 3,
+    locked_target_id: Optional[int] = None,
 ) -> AimGuide:
     guide = AimGuide(power=power)
     direction = cue_direction.astype(float)
@@ -727,61 +823,107 @@ def trace_ball_collision_chain(
     direction /= norm
     guide.cue_direction = direction
     guide.shot_speed = power_to_shot_speed(power, table)
-    bounds = table.bounds
     radius = max(4.0, ball_radius_px)
-    remaining = [b for b in balls if b.id != cue_ball.id]
+    remaining_balls = [b for b in balls if b.id != cue_ball.id]
 
-    cue_path, first_hit, hit_point, incoming = trace_cue_path(
-        cue_ball.center.astype(float), direction, radius, table, remaining, max_bounces=3
+    cue_path, first_hit, ghost_center, incoming, _ = trace_cue_path(
+        cue_ball.center.astype(float), direction, radius, table, pockets, remaining_balls, max_bounces=0
     )
     guide.cue_path = cue_path
 
-    if first_hit is None or hit_point is None:
+    # Apply Target Lock
+    target_ball = first_hit
+    if locked_target_id is not None and (target_ball is None or target_ball.id != locked_target_id):
+        locked_ball = next((b for b in balls if b.id == locked_target_id), None)
+        if locked_ball is not None:
+            # Check if aim is reasonably close to the locked ball
+            p1 = cue_path[0]
+            p2 = p1 + direction * 2000.0
+            diff = p2 - p1
+            dist = float(np.linalg.norm(np.cross(diff, p1 - locked_ball.center.astype(float))) / np.linalg.norm(diff))
+            
+            if dist < radius * 4.0:
+                target_ball = locked_ball
+                # Recalculate ghost_center
+                c_diff = p1 - locked_ball.center.astype(float)
+                b = 2.0 * float(np.dot(c_diff, direction))
+                c = float(np.dot(c_diff, c_diff)) - (2.0 * radius) ** 2
+                disc = b*b - 4*c
+                if disc >= 0:
+                    t = (-b - math.sqrt(disc)) / 2.0
+                    ghost_center = p1 + direction * t
+                    guide.cue_path = [p1, ghost_center]
+                    incoming = direction
+
+    if target_ball is None or ghost_center is None:
         guide.notes.append("No ball in cue path.")
         return guide
 
-    guide.first_hit_ball_id  = first_hit.id
-    guide.first_hit_point    = hit_point.astype(float)
-    guide.notes.append(f"Cue hits ball {first_hit.id}")
-    guide.notes.append(f"Shot speed: {guide.shot_speed:.0f}px")
+    guide.first_hit_ball_id = target_ball.id
+    guide.first_hit_point = ghost_center  # Visually, the cue ball stops at the ghost ball center
 
-    avg_radius = max(4.0, ball_radius_px)
-    incoming_norm = incoming / max(float(np.linalg.norm(incoming)), 1e-6)
-    ghost = first_hit.center.astype(float) - incoming_norm * (2.0 * avg_radius)
-    guide.cue_deflection_path = predict_cue_after_impact(cue_ball, first_hit, ghost, table, max_bounces=3)
+    # The game's default object-ball aim guide direction is from ghost_center to object_center
+    obj_center = target_ball.center.astype(float)
+    obj_dir = unit_vector(ghost_center, obj_center)
+    
+    # physical contact point between cue and object ball
+    contact_point = obj_center - obj_dir * target_ball.radius
+    guide.physical_contact_point = contact_point
+    
+    # Start Green Path from the physical contact point
+    edge_start_pt = contact_point
+    
+    green_remaining = [b for b in balls if b.id != cue_ball.id and b.id != target_ball.id]
+    g_type, g_hit_point, _, g_obj, g_normal = _find_first_collision(
+        edge_start_pt, obj_dir, green_remaining, table.rails, pockets, radius
+    )
 
-    visited: set[int] = {cue_ball.id}
-    current_ball   = first_hit
-    current_center = current_ball.center.astype(float)
-    current_dir    = object_exit_direction(incoming, current_center, hit_point)
-    current_speed  = guide.shot_speed * 0.92
+    if g_type == "NONE":
+        guide.object_path = [edge_start_pt, edge_start_pt + obj_dir * 2000.0]
+    else:
+        guide.object_path = [edge_start_pt, g_hit_point]
 
-    for depth in range(max_chain_depth):
-        if current_ball.id in visited:
-            break
-        visited.add(current_ball.id)
+        # Yellow Path: Reflections
+        if g_type == "RAIL":
+            reflected_dir = reflect_vector(obj_dir, g_normal)
+            yellow_path = trace_path_with_reflections(
+                g_hit_point, reflected_dir, radius, table, max_bounces=max_bounces
+            )
+            guide.object_reflection_path = yellow_path
+            
+        # Orange Path: Secondary Collisions
+        elif g_type == "BALL" and g_obj is not None:
+            guide.secondary_ball_id = g_obj.id
+            # For secondary ball, use the same geometric logic
+            sec_ghost_center = g_hit_point
+            sec_dir = unit_vector(sec_ghost_center, g_obj.center.astype(float))
+            sec_contact_point = g_obj.center.astype(float) - sec_dir * g_obj.radius
+            sec_type, sec_hit_point, _, _, _ = _find_first_collision(
+                sec_contact_point, sec_dir, [], table.rails, pockets, radius
+            )
+            if sec_type != "NONE":
+                guide.secondary_path = [sec_contact_point, sec_hit_point]
+            else:
+                guide.secondary_path = [sec_contact_point, sec_contact_point + sec_dir * 2000.0]
 
-        path_points, next_ball = _trace_ball_path_until_hit(
-            current_center, current_dir, current_ball.radius, table, balls, visited
+    # Calculate cue ball deflection starting from ghost_center (cue ball's position at impact)
+    # BUG 4 FIX: was incorrectly starting from contact_point (object ball surface edge)
+    cue_deflection_dir = incoming - np.dot(incoming, obj_dir) * obj_dir
+    norm_deflection = float(np.linalg.norm(cue_deflection_dir))
+    if norm_deflection > 1e-6:
+        cue_deflection_dir /= norm_deflection
+        deflection_start = ghost_center.astype(float)  # cue ball center at moment of impact
+        deflection_remaining = [b for b in balls if b.id != cue_ball.id and b.id != target_ball.id]
+        def_type, def_hit_point, _, _, def_normal = _find_first_collision(
+            deflection_start, cue_deflection_dir, deflection_remaining, table.rails, pockets, radius
         )
-        guide.collision_paths.append(
-            BallPath(ball_id=current_ball.id, path=path_points, speed=current_speed, label=f"ball_{current_ball.id}")
-        )
-        if depth == 0:
-            guide.object_path = path_points
-        if next_ball is None:
-            break
-
-        hit_t = _ray_ball_intersect(current_center, current_dir, next_ball, current_ball.radius * 2.2)
-        if hit_t is None:
-            break
-        next_hit_point = current_center + current_dir * hit_t
-        guide.notes.append(f"Ball {current_ball.id} hits ball {next_ball.id}")
-
-        current_dir    = object_exit_direction(current_dir, next_ball.center.astype(float), next_hit_point)
-        current_center = next_ball.center.astype(float)
-        current_ball   = next_ball
-        current_speed  *= 0.78
+        if def_type == "NONE":
+            guide.cue_deflection_path = [deflection_start, deflection_start + cue_deflection_dir * 150.0]
+        else:
+            guide.cue_deflection_path = [deflection_start, def_hit_point]
+            if def_type == "RAIL":
+                r_dir = reflect_vector(cue_deflection_dir, def_normal)
+                guide.cue_deflection_path.append(def_hit_point + r_dir * 50.0)
 
     return guide
 
@@ -874,25 +1016,31 @@ def _trace_ball_path_until_hit(
     direction: np.ndarray,
     radius: float,
     table: TableDetection,
+    pockets: list[Pocket],
     balls: list[BallDetection],
     ignore_ids: set[int],
+    max_bounces: int = 3,
 ) -> tuple[list[np.ndarray], BallDetection | None]:
     direction = direction / max(float(np.linalg.norm(direction)), 1e-6)
     pos  = start.astype(float).copy()
     path: list[np.ndarray] = [pos.copy()]
     remaining = [b for b in balls if b.id not in ignore_ids]
 
-    for _ in range(2):
-        wall_t, wall_point, wall_normal = _ray_to_table_rails(pos, direction, table.rails, radius)
-        ball_hit = _first_ball_on_ray(pos, direction, remaining, radius * 2.0, wall_t)
-        if ball_hit is not None:
-            ball, hit_t = ball_hit
-            hit_point = pos + direction * hit_t
+    for _ in range(max_bounces + 1):
+        ctype, hit_point, dist, obj, normal = _find_first_collision(
+            pos, direction, remaining, table.rails, pockets, radius
+        )
+        if ctype == "NONE" or ctype == "POCKET":
+            if ctype == "POCKET":
+                path.append(hit_point.astype(float))
+            break
+        elif ctype == "BALL":
             path.append(hit_point.astype(float))
-            return path, ball
-        path.append(wall_point.astype(float))
-        direction = reflect_vector(direction, wall_normal)
-        pos = wall_point + direction * max(1.5, radius * 0.15)
+            return path, obj
+        elif ctype == "RAIL":
+            path.append(hit_point.astype(float))
+            direction = reflect_vector(direction, normal)
+            pos = hit_point + direction * max(1.5, radius * 0.15)
 
     return path, None
 
@@ -986,8 +1134,8 @@ def build_aim_guide(
     table: Optional[TableDetection],
     cue_direction: Optional[np.ndarray],
     power: float,
-    max_bounces: int = 2,
+    max_bounces: int = 3,
 ) -> AimGuide:
     if cue_ball is None or table is None or cue_direction is None:
         return AimGuide(power=power, notes=["Cue direction not detected."])
-    return trace_ball_collision_chain(cue_ball, balls, table, cue_direction, power)
+    return trace_ball_collision_chain(cue_ball, balls, table, cue_direction, power, [], max_bounces=max_bounces)

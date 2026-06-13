@@ -11,8 +11,8 @@ from .geometry import (
     trace_ball_collision_chain,
     unit_vector,
 )
-from .models import AimGuide, BallDetection, BallKind, FrameAnalysis, Pocket
-from .table_lock import TableGeometryLock
+from .models import AimGuide, BallDetection, BallKind, FrameAnalysis, GameState, Pocket, VisualizerConfig
+from .calibration import CalibrationManager
 from .tracker import BallTracker
 
 
@@ -22,15 +22,24 @@ class VideoAnalyzer:
     def __init__(self) -> None:
         self.detector = PoolDetector()
         self.tracker = BallTracker()
-        self.table_lock = TableGeometryLock()
+        self.calibration = CalibrationManager()
+        self.target_lock_id: int | None = None
+        self._frame_index: int = 0
+        self._last_detection_frame: int = -999
+        self.state: GameState = GameState.READY
+        self.settle_frames: int = 0
+        self.config = VisualizerConfig()
+        self.detection_interval_frames: int = 12
+        # BUG 1 FIX: attributes referenced in _select_target() but were never defined
         self.selected_object_ball_id: int | None = None
         self.selected_pocket_id: int | None = None
-        self._frame_index: int = 0
+        self._first_frame_printed: bool = False
 
     def reset_tracking(self) -> None:
         self.tracker.reset()
-        self.table_lock.reset()
         self._frame_index = 0
+        self.target_lock_id = None
+        self._last_detection_frame = -999
 
     def analyze_frame(self, frame, frame_index: int = 0, track: bool = True) -> FrameAnalysis:
         self._frame_index = frame_index
@@ -38,19 +47,60 @@ class VideoAnalyzer:
         if frame is None or getattr(frame, "size", 0) == 0:
             return FrameAnalysis(frame_index=frame_index, table=None, balls=[], pockets=[])
 
-        table = self.detector.detect_table(frame)
-        if not self._table_is_valid(table):
-            if self.table_lock.is_locked:
-                table, _ = self.table_lock.apply(None, [], frame_index)
-            if table is None:
-                return FrameAnalysis(frame_index=frame_index, table=None, balls=[], pockets=[])
+        if not self.calibration.is_calibrated():
+            return FrameAnalysis(frame_index=frame_index, table=None, balls=[], pockets=[])
 
-        pockets = self.detector.compute_pockets(table)  # type: ignore[arg-type]
-        table, pockets = self.table_lock.apply(table, pockets, frame_index)  # type: ignore[arg-type]
+        table, pockets = self.calibration.get_table_and_pockets()
+        if table is None:
+            return FrameAnalysis(frame_index=frame_index, table=None, balls=[], pockets=[])
 
-        balls = self.detector.detect_balls(frame, table, pockets=pockets)
+        # ROI Crop for YOLO performance
+        fh, fw = frame.shape[:2]
+        corners = self.calibration.load_corners()
+        cx = max(0, int(corners[:, 0].min()))
+        cy = max(0, int(corners[:, 1].min()))
+        cx2 = min(fw, int(corners[:, 0].max()))
+        cy2 = min(fh, int(corners[:, 1].max()))
+        roi_frame = frame[cy:cy2, cx:cx2].copy() if (cx2 > cx and cy2 > cy) else frame
+
+        # Periodic YOLO Detection
+        frames_since_detection = frame_index - self._last_detection_frame
+        min_retry = max(3, self.detection_interval_frames // 3)
+        should_detect = (
+            frames_since_detection >= self.detection_interval_frames
+            or (len(self.tracker._tracks) < 2 and frames_since_detection >= min_retry)
+        )
+        if should_detect:
+            import copy
+            roi_table = copy.deepcopy(table)
+            roi_table.polygon = roi_table.polygon - [cx, cy]
+            rx, ry, rw, rh = roi_table.bounds
+            roi_table.bounds = (max(0, rx - cx), max(0, ry - cy), rw, rh)
+            if roi_table.corners is not None:
+                roi_table.corners = roi_table.corners - [cx, cy]
+            for rail in roi_table.rails:
+                rail.start = rail.start - [cx, cy]
+                rail.end = rail.end - [cx, cy]
+            
+            roi_pockets = copy.deepcopy(pockets)
+            for p in roi_pockets:
+                p.center = p.center - [cx, cy]
+
+            detected_balls = self.detector.detect_balls(roi_frame, roi_table, pockets=roi_pockets)
+            
+            # Map detections back to full-frame space
+            for b in detected_balls:
+                b.center = np.array([b.center[0] + cx, b.center[1] + cy], dtype=float)
+                
+            self._last_detection_frame = frame_index
+        else:
+            detected_balls = []
+
         if track:
-            balls = self.tracker.assign(balls)
+            # When detected_balls is empty, tracker extrpolates existing tracks
+            balls = self.tracker.assign(detected_balls)
+        else:
+            balls = detected_balls
 
         ball_radius_px = self._calibrate_radius(balls)
         cue_ball = self._ensure_cue_ball(frame, balls, table)
@@ -58,7 +108,7 @@ class VideoAnalyzer:
             existing_ids = {b.id for b in balls}
             if cue_ball.id not in existing_ids:
                 if track:
-                    cue_ball = self.tracker.assign([cue_ball])[0]
+                    cue_ball.id = self.tracker.register_single(cue_ball)
                 balls.append(cue_ball)
             else:
                 for ball in balls:
@@ -66,6 +116,7 @@ class VideoAnalyzer:
                         ball.kind = BallKind.CUE
                         break
 
+        # Always read cue direction every frame (it uses fast OpenCV edge/line detection)
         cue_direction = self.detector.detect_cue_direction(frame, table, cue_ball, balls)
         power = max(
             self.detector.detect_power(frame, table),
@@ -73,63 +124,70 @@ class VideoAnalyzer:
             35.0 if cue_direction is not None else 0.0,
         )
 
-        guide = self._build_guide(cue_ball, balls, table, cue_direction, power, ball_radius_px)
+        # State Machine Update
+        max_speed = 0.0
+        if balls:
+            max_speed = max(self.tracker.get_speed(b.id) for b in balls)
 
-        is_aim_mode = cue_direction is not None or (
-            guide.cue_direction is not None and guide.first_hit_ball_id is not None
-        )
-        operating_mode = "MODE A: Extended Guideline" if is_aim_mode else "MODE B: Recommendation"
+        movement_threshold = 2.0
+        previous_state = self.state
 
-        object_ball, pocket = self._select_target(
-            cue_ball, balls, pockets, table, guide, ball_radius_px, is_aim_mode,
-        )
+        if max_speed > movement_threshold:
+            self.state = GameState.SHOT_IN_PROGRESS
+            self.settle_frames = 0
+            self.target_lock_id = None # Clear lock on shot
+        elif max_speed <= movement_threshold and self.state == GameState.SHOT_IN_PROGRESS:
+            self.state = GameState.TABLE_SETTLING
+        
+        if self.state == GameState.TABLE_SETTLING:
+            self.settle_frames += 1
+            if self.settle_frames > 20:  # ~0.6 seconds at 30fps
+                self.state = GameState.READY
+                
+        if self.state == GameState.READY and cue_direction is not None:
+            self.state = GameState.AIMING
+        elif self.state == GameState.AIMING and cue_direction is None:
+            self.state = GameState.READY
 
-        # Always try to fill metrics when we have cue + object
-        if pocket is None and object_ball is not None and cue_ball is not None:
-            pocket = recommend_pocket(cue_ball, object_ball, pockets, balls, table, ball_radius_px)
+        if previous_state != self.state:
+            print(f"[STATE] {self.state.name}")
 
-        if not guide.collision_paths and cue_ball is not None and object_ball is not None:
-            direction = guide.cue_direction
-            if direction is None:
-                direction = unit_vector(cue_ball.center, object_ball.center)
-            if float(np.linalg.norm(direction)) > 1e-6:
-                chain_guide = trace_ball_collision_chain(
-                    cue_ball, balls, table, direction, max(power, 40.0),
-                    ball_radius_px=ball_radius_px, max_chain_depth=4,
-                )
-                if chain_guide.collision_paths:
-                    guide.collision_paths = chain_guide.collision_paths
-                    guide.object_path = chain_guide.object_path or guide.object_path
-                    guide.cue_deflection_path = chain_guide.cue_deflection_path or guide.cue_deflection_path
-                    guide.first_hit_ball_id = chain_guide.first_hit_ball_id or guide.first_hit_ball_id
-                    guide.first_hit_point = chain_guide.first_hit_point or guide.first_hit_point
-                    guide.cue_path = chain_guide.cue_path or guide.cue_path
-                    guide.cue_direction = chain_guide.cue_direction or guide.cue_direction
-                    guide.shot_speed = chain_guide.shot_speed or guide.shot_speed
+        # BUG 7 FIX: suppress per-frame print flood (only print on first frame)
+        if not self._first_frame_printed:
+            self._first_frame_printed = True
+
+        if self.state in (GameState.SHOT_IN_PROGRESS, GameState.TABLE_SETTLING):
+            return FrameAnalysis(
+                frame_index=frame_index, table=table, balls=balls, pockets=pockets,
+                state=self.state, ball_radius_px=ball_radius_px, operating_mode="Tracking...",
+                config=self.config,
+            )
+
+        # Build trajectory guide
+        guide = self._build_guide(cue_ball, balls, table, cue_direction, power, ball_radius_px, pockets)
+
+        # Target Locking Logic
+        if guide.first_hit_ball_id is not None:
+            self.target_lock_id = guide.first_hit_ball_id
 
         analysis = FrameAnalysis(
-            frame_index=frame_index,
-            table=table,
-            balls=balls,
-            pockets=pockets,
-            ball_radius_px=ball_radius_px,
-            operating_mode=operating_mode,
+            frame_index=frame_index, table=table, balls=balls, pockets=pockets,
+            state=self.state, ball_radius_px=ball_radius_px,
+            operating_mode="MODE A: Trajectory Visualizer",
+            config=self.config,
         )
         analysis.guide = guide
-        analysis.shot = predict_shot(cue_ball, object_ball, pocket, balls, table, ball_radius_px)
 
-        if guide.collision_paths and analysis.shot.valid:
-            first_path = guide.collision_paths[0].path
-            if len(first_path) >= 2:
-                analysis.shot.bank_path = first_path
-            if guide.cue_deflection_path:
-                analysis.shot.cue_after_impact = guide.cue_deflection_path
-            if guide.first_hit_point is not None and guide.cue_direction is not None:
-                ghost = guide.first_hit_point - guide.cue_direction * (2.0 * ball_radius_px)
-                analysis.shot.ghost_ball_center = ghost
-                if cue_ball is not None:
-                    analysis.shot.cue_to_ghost = (cue_ball.center, ghost)
-
+        # BUG 2 FIX: _select_target() was defined but never called — wire it up now
+        is_aim_mode = cue_direction is not None
+        object_ball, pocket = self._select_target(
+            cue_ball, balls, pockets, table, guide, ball_radius_px, is_aim_mode
+        )
+        if object_ball is not None and pocket is not None and cue_ball is not None:
+            from .geometry import predict_shot
+            analysis.shot = predict_shot(
+                cue_ball, object_ball, pocket, balls, table, ball_radius_px
+            )
         return analysis
 
     def _select_target(
@@ -219,14 +277,16 @@ class VideoAnalyzer:
         cue_direction,
         power,
         ball_radius_px: float,
+        pockets: list[Pocket],
     ) -> AimGuide:
         if cue_ball is None or table is None:
             return AimGuide(power=power, notes=["Cue ball or table not detected."])
 
         if cue_direction is not None:
             return trace_ball_collision_chain(
-                cue_ball, balls, table, cue_direction, max(power, 40.0),
-                ball_radius_px=ball_radius_px, max_chain_depth=4,
+                cue_ball, balls, table, cue_direction, max(power, 40.0), pockets,
+                ball_radius_px=ball_radius_px, max_chain_depth=2, max_bounces=self.config.max_bounces,
+                locked_target_id=self.target_lock_id
             )
 
         # Fallback: line from cue to nearest object ball

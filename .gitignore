@@ -9,3 +9,26 @@ build/
 *.mov
 *.mkv
 *.wmv
+
+# Calibration data
+calibration.json
+
+# Local debug files and images
+debug_*.png
+qscreen_capture.png
+*.zip
+
+# Local YOLO files / models
+models/
+runs/
+*.pt
+8-ball-detector-1/
+
+# Test scripts (scratch files)
+capture_test.py
+capture_test_qscreen.py
+test_wgc.py
+test_wgc_wrapper.py
+train_yolo.py
+colab_yolo_training.ipynb
+BUG_REPORT.md

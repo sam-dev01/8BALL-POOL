@@ -39,9 +39,9 @@ def main() -> None:
     )
     blocker2 = BallDetection(id=2, center=np.array([300.0, 100.0]), radius=10.0, kind=BallKind.STRIPE, confidence=0.9)
     direction = np.array([1.0, 0.0])
-    guide = trace_ball_collision_chain(cue, [obj, blocker2], table, direction, power=60.0)
+    guide = trace_ball_collision_chain(cue, [obj, blocker2], table, direction, power=60.0, pockets=[pocket])
     assert guide.first_hit_ball_id == 1
-    assert len(guide.collision_paths) >= 1
+    assert len(guide.object_path) >= 2
     assert len(guide.cue_path) >= 2
 
     print("Analysis math test passed")

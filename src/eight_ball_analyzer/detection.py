@@ -11,6 +11,7 @@ from .models import BallDetection, BallKind, Pocket, Rail, TableDetection
 
 
 YOLO_CLASS_MAP = {
+    "ball": BallKind.UNKNOWN,
     "cue_ball": BallKind.CUE,
     "cue": BallKind.CUE,
     "solid_ball": BallKind.SOLID,
@@ -48,94 +49,6 @@ def _default_yolo_model_path() -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Corner utilities
-# ---------------------------------------------------------------------------
-
-def _sort_corners(pts: np.ndarray) -> np.ndarray:
-    """Return [top-left, top-right, bottom-right, bottom-left]."""
-    pts = pts.reshape(-1, 2).astype(float)
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).ravel()
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(d)]
-    bl = pts[np.argmax(d)]
-    return np.array([tl, tr, br, bl], dtype=float)
-
-
-def _build_perspective_transform(
-    corners: np.ndarray,
-    width_px: float,
-    height_px: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute 3×3 homographies image↔normalised [0,1]²."""
-    src = corners.astype(np.float32)         # [TL, TR, BR, BL]
-    dst = np.array(
-        [[0.0, 0.0], [width_px, 0.0], [width_px, height_px], [0.0, height_px]],
-        dtype=np.float32,
-    )
-    M = cv2.getPerspectiveTransform(src, dst)
-    M_inv = cv2.getPerspectiveTransform(dst, src)
-    return M, M_inv
-
-
-def _build_rails(corners: np.ndarray) -> list[Rail]:
-    """Create 4 rail objects from sorted corners [TL, TR, BR, BL].
-
-    Rail ids: 0=top, 1=right, 2=bottom, 3=left
-    Normals point inward (toward table centre).
-    """
-    tl, tr, br, bl = corners
-
-    def _inward_normal(start: np.ndarray, end: np.ndarray, centre: np.ndarray) -> np.ndarray:
-        seg = end - start
-        n = np.array([-seg[1], seg[0]], dtype=float)
-        n /= max(float(np.linalg.norm(n)), 1e-6)
-        mid = (start + end) / 2.0
-        if float(np.dot(n, centre - mid)) < 0:
-            n = -n
-        return n
-
-    centre = (tl + tr + br + bl) / 4.0
-    return [
-        Rail(id=0, start=tl.copy(), end=tr.copy(), normal=_inward_normal(tl, tr, centre)),  # top
-        Rail(id=1, start=tr.copy(), end=br.copy(), normal=_inward_normal(tr, br, centre)),  # right
-        Rail(id=2, start=br.copy(), end=bl.copy(), normal=_inward_normal(br, bl, centre)),  # bottom
-        Rail(id=3, start=bl.copy(), end=tl.copy(), normal=_inward_normal(bl, tl, centre)),  # left
-    ]
-
-
-def _compute_pockets(corners: np.ndarray, short_side: float) -> list[Pocket]:
-    """Derive 6 pocket positions mathematically from the 4 table corners.
-
-    Pocket IDs:
-        0 = top-left    1 = top-middle    2 = top-right
-        3 = bottom-left 4 = bottom-middle 5 = bottom-right
-
-    Corner pockets have a larger mouth radius than middle pockets.
-    """
-    tl, tr, br, bl = corners
-    tm = (tl + tr) / 2.0  # top-middle
-    bm = (bl + br) / 2.0  # bottom-middle
-
-    corner_r = max(10.0, short_side * 0.055)
-    middle_r = max(8.0, short_side * 0.045)
-
-    specs = [
-        (0, tl,  corner_r, "top-left"),
-        (1, tm,  middle_r, "top-middle"),
-        (2, tr,  corner_r, "top-right"),
-        (3, bl,  corner_r, "bottom-left"),
-        (4, bm,  middle_r, "bottom-middle"),
-        (5, br,  corner_r, "bottom-right"),
-    ]
-    return [
-        Pocket(id=pid, center=c.copy(), mouth_radius=r, label=lbl)
-        for pid, c, r, lbl in specs
-    ]
-
-
-# ---------------------------------------------------------------------------
 # Main detector
 # ---------------------------------------------------------------------------
 
@@ -143,23 +56,24 @@ class PoolDetector:
     def __init__(
         self,
         yolo_model_path: str | Path | None = None,
-        yolo_confidence: float = 0.80,
+        yolo_confidence: float = 0.45,
     ) -> None:
         self.yolo_confidence = yolo_confidence
+        self.last_corners: np.ndarray | None = None
         self._yolo_model = None
         self._yolo_model_path = (
             Path(yolo_model_path)
             if yolo_model_path is not None
             else _default_yolo_model_path()
         )
-        if self._yolo_model_path is not None:
-            self._load_yolo_model()
+        self._yolo_load_attempted = False
 
     @property
     def has_yolo_model(self) -> bool:
         return self._yolo_model is not None
 
     def _load_yolo_model(self) -> None:
+        self._yolo_load_attempted = True
         try:
             from ultralytics import YOLO
         except ImportError:
@@ -169,163 +83,6 @@ class PoolDetector:
             self._yolo_model = YOLO(str(self._yolo_model_path))
         except Exception:
             self._yolo_model = None
-
-    # ------------------------------------------------------------------
-    # STAGE 1 — TABLE DETECTION (always the first call)
-    # ------------------------------------------------------------------
-
-    def detect_table(self, frame: np.ndarray) -> TableDetection | None:
-        """Detect the playable area, extract 4 corners, build perspective
-        transform, create Rail objects and mathematically derive pockets.
-        Returns a fully-populated TableDetection or None on failure.
-        """
-        if frame is None or frame.size == 0:
-            return None
-
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        # Tighten masks to avoid dark/gray UI elements around the table
-        green_mask = cv2.inRange(hsv, np.array([35, 60, 50]), np.array([85, 255, 255]))
-        blue_mask  = cv2.inRange(hsv, np.array([90, 80, 50]), np.array([125, 255, 255]))
-        mask = cv2.bitwise_or(green_mask, blue_mask)
-        
-        # Zero out the left and right 12% to disconnect the cloth from UI side panels
-        margin = int(frame.shape[1] * 0.12)
-        mask[:, :margin] = 0
-        mask[:, -margin:] = 0
-        
-        kernel = np.ones((9, 9), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return self._fallback_table(frame)
-
-        frame_area = frame.shape[0] * frame.shape[1]
-        frame_cx = frame.shape[1] / 2.0
-        frame_cy = frame.shape[0] / 2.0
-        max_center_dist = float(np.hypot(frame_cx, frame_cy)) or 1.0
-
-        best_score = -1.0
-        best_contour = None
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < frame_area * 0.02:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            if h == 0:
-                continue
-            aspect = w / float(h)
-            rectangularity = area / float(w * h)
-            if not _TABLE_ASPECT_MIN <= aspect <= _TABLE_ASPECT_MAX or rectangularity < 0.45:
-                continue
-            centre_y = y + h / 2.0
-            centre_x = x + w / 2.0
-            upper_penalty = 0.7 if centre_y < frame.shape[0] * 0.25 else 1.0
-            aspect_score = 1.0 - min(1.0, abs(aspect - 2.0) / 1.2)
-            centre_dist = float(np.hypot(centre_x - frame_cx, centre_y - frame_cy))
-            centre_bonus = 1.0 + 0.6 * (1.0 - centre_dist / max_center_dist)
-            score = area * rectangularity * (0.65 + 0.35 * aspect_score) * upper_penalty * centre_bonus
-            if score > best_score:
-                best_score = score
-                best_contour = contour
-
-        if best_contour is None:
-            return self._fallback_table(frame)
-
-        return self._build_table_from_contour(best_contour, frame.shape[:2], frame_area)
-
-    def _build_table_from_contour(
-        self,
-        contour: np.ndarray,
-        frame_shape: tuple[int, int],
-        frame_area: int,
-    ) -> TableDetection:
-        """From a cloth contour, extract corners, build transform, rails, pockets."""
-        area = cv2.contourArea(contour)
-        rect = cv2.minAreaRect(contour)
-        box_pts = cv2.boxPoints(rect).astype(np.int32)
-        corners = _sort_corners(box_pts.astype(float))   # [TL, TR, BR, BL]
-
-        x, y, w, h = cv2.boundingRect(contour)
-        bounds = (x, y, w, h)
-        confidence = float(np.clip(area / frame_area * 2.5, 0.0, 1.0))
-
-        # Perspective-corrected table dimensions
-        top_w    = float(np.linalg.norm(corners[1] - corners[0]))
-        bottom_w = float(np.linalg.norm(corners[2] - corners[3]))
-        left_h   = float(np.linalg.norm(corners[3] - corners[0]))
-        right_h  = float(np.linalg.norm(corners[2] - corners[1]))
-        width_px  = max((top_w + bottom_w) / 2.0, 1.0)
-        height_px = max((left_h + right_h) / 2.0, 1.0)
-
-        # Validate aspect ratio
-        aspect = width_px / height_px
-        if not _TABLE_ASPECT_MIN <= aspect <= _TABLE_ASPECT_MAX:
-            # Still build, but mark lower confidence
-            confidence *= 0.5
-
-        M, M_inv = _build_perspective_transform(corners, width_px, height_px)
-        rails = _build_rails(corners)
-        polygon = box_pts
-
-        table = TableDetection(
-            polygon=polygon,
-            bounds=bounds,
-            confidence=confidence,
-            corners=corners,
-            width_px=width_px,
-            height_px=height_px,
-            transform_matrix=M,
-            inv_transform_matrix=M_inv,
-            rails=rails,
-        )
-        return table
-
-    def _fallback_table(self, frame: np.ndarray) -> TableDetection:
-        """Return a best-guess table when cloth detection fails."""
-        height, width = frame.shape[:2]
-        mx = int(width * 0.08)
-        my = int(height * 0.14)
-        x, y = mx, my
-        w, h = width - 2 * mx, height - 2 * my
-        bounds = (x, y, w, h)
-        corners = np.array(
-            [[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=float
-        )
-        polygon = corners.astype(np.int32)
-        width_px  = float(w)
-        height_px = float(h)
-        M, M_inv = _build_perspective_transform(corners, width_px, height_px)
-        rails = _build_rails(corners)
-        return TableDetection(
-            polygon=polygon,
-            bounds=bounds,
-            confidence=0.25,
-            corners=corners,
-            width_px=width_px,
-            height_px=height_px,
-            transform_matrix=M,
-            inv_transform_matrix=M_inv,
-            rails=rails,
-        )
-
-    # ------------------------------------------------------------------
-    # STAGE 2 — POCKET SYSTEM (mathematical, from locked corners)
-    # ------------------------------------------------------------------
-
-    def compute_pockets(self, table: TableDetection) -> list[Pocket]:
-        """Derive pocket positions mathematically from table corners.
-        Never called every frame — only when the table geometry changes.
-        """
-        short_side = min(table.width_px, table.height_px)
-        return _compute_pockets(table.corners, short_side)
-
-    # Back-compat shim (old name was detect_pockets)
-    def detect_pockets(self, table: TableDetection | None) -> list[Pocket]:
-        if table is None:
-            return []
-        return self.compute_pockets(table)
 
     # ------------------------------------------------------------------
     # STAGE 5 — BALL DETECTION (only after table geometry is locked)
@@ -341,9 +98,12 @@ class PoolDetector:
         if table is None:
             return []
 
-        yolo_balls = self._detect_balls_yolo(frame, table)
-        if yolo_balls:
-            return yolo_balls
+        if self._yolo_model_path is not None and not self._yolo_load_attempted:
+            self._load_yolo_model()
+
+        yolo_balls: list[BallDetection] = []
+        if self.has_yolo_model:
+            yolo_balls = self._detect_balls_yolo(frame, table)
 
         x, y, w, h = table.bounds
         # Tighter inset — ignore cushion strips and UI around the table edge
@@ -361,7 +121,7 @@ class PoolDetector:
         min_radius = max(3, int(min(w, h) * 0.009))
         max_radius = max(min_radius + 3, int(min(w, h) * 0.058))
         if pockets is None:
-            pockets = self.compute_pockets(table)
+            pockets = []
 
         circles = sorted(
             self._merge_circles(
@@ -434,7 +194,7 @@ class PoolDetector:
             if len(balls) >= 16:
                 break
 
-        balls = self._merge_ball_detections(balls)
+        balls = self._merge_ball_detections(yolo_balls + balls)
         balls = self._enforce_ball_inventory(balls)
         balls.sort(key=lambda b: (0 if b.kind == BallKind.CUE else 1, b.center[1], b.center[0]))
         for new_id, ball in enumerate(balls):
@@ -482,12 +242,26 @@ class PoolDetector:
 
     def _guideline_color_mask(self, hsv: np.ndarray) -> np.ndarray:
         """Mask pixels that belong to the in-game aim guideline overlay."""
-        white = cv2.inRange(hsv, np.array([0, 0, 175]), np.array([180, 70, 255]))
-        cyan = cv2.inRange(hsv, np.array([75, 35, 140]), np.array([110, 255, 255]))
-        yellow = cv2.inRange(hsv, np.array([15, 40, 150]), np.array([48, 255, 255]))
-        magenta = cv2.inRange(hsv, np.array([130, 40, 120]), np.array([175, 255, 255]))
-        pink = cv2.inRange(hsv, np.array([160, 25, 140]), np.array([179, 255, 255]))
-        mask = cv2.bitwise_or(white, cv2.bitwise_or(cyan, cv2.bitwise_or(yellow, cv2.bitwise_or(magenta, pink))))
+        white   = cv2.inRange(hsv, np.array([0,   0,   175]), np.array([180,  70, 255]))
+        cyan    = cv2.inRange(hsv, np.array([75,  35,  140]), np.array([110, 255, 255]))
+        yellow  = cv2.inRange(hsv, np.array([15,  40,  150]), np.array([48,  255, 255]))
+        magenta = cv2.inRange(hsv, np.array([130, 40,  120]), np.array([175, 255, 255]))
+        pink    = cv2.inRange(hsv, np.array([160, 25,  140]), np.array([179, 255, 255]))
+        # BUG 6 FIX: add orange range (missing from original mask)
+        orange  = cv2.inRange(hsv, np.array([5,  120,  150]), np.array([18,  255, 255]))
+        mask = cv2.bitwise_or(
+            white,
+            cv2.bitwise_or(
+                cyan,
+                cv2.bitwise_or(
+                    yellow,
+                    cv2.bitwise_or(
+                        magenta,
+                        cv2.bitwise_or(pink, orange),
+                    ),
+                ),
+            ),
+        )
         cloth = cv2.inRange(hsv, np.array([32, 35, 35]), np.array([98, 255, 255]))
         return cv2.bitwise_and(mask, cv2.bitwise_not(cloth))
 
@@ -801,6 +575,11 @@ class PoolDetector:
             if not self._inside_table(center, table):
                 continue
             color = self._sample_color(frame, int(center[0]), int(center[1]), int(radius))
+            
+            # If YOLO just detected a generic 'ball', we must classify it by color
+            if kind == BallKind.UNKNOWN:
+                kind = classify_ball(color)
+                
             candidates.append(
                 BallDetection(id=index, center=center, radius=float(radius),
                               kind=kind, confidence=confidence, color_bgr=color)
@@ -1081,19 +860,69 @@ class PoolDetector:
 
 
 # ---------------------------------------------------------------------------
-# Ball colour classifier
+# Ball colour classifier — HSV hue-sector based (BUG 5 FIX)
 # ---------------------------------------------------------------------------
 
 def classify_ball(color_bgr: tuple[int, int, int]) -> BallKind:
-    b, g, r = color_bgr
-    brightness = (int(b) + int(g) + int(r)) / 3.0
+    """Classify ball type using HSV hue-sector mapping.
+
+    Replaces the old RGB threshold approach which misclassified:
+    - Yellow solids (1-ball) as STRIPE (bright with spread > 45)
+    - Dark stripes as EIGHT (brightness < 55)
+    This HSV approach uniquely maps each hue range to a ball type.
+    """
+    b, g, r = int(color_bgr[0]), int(color_bgr[1]), int(color_bgr[2])
+    brightness = (b + g + r) / 3.0
     spread = max(color_bgr) - min(color_bgr)
-    if brightness > 158 and spread < 70:
+
+    # White cue ball: very low saturation, high value
+    if brightness > 158 and spread < 60:
         return BallKind.CUE
-    if brightness < 55:
+
+    # Black 8-ball: very dark across all channels (check before hue to avoid maroon confusion)
+    if brightness < 45 and spread < 50:
         return BallKind.EIGHT
-    if r > 140 and g > 110 and b < 120:
-        return BallKind.SOLID
-    if brightness > 155 and spread > 45:
+
+    # Convert to HSV for hue classification
+    pixel = np.array([[[b, g, r]]], dtype=np.uint8)
+    hsv_pixel = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0, 0]
+    h, s, v = int(hsv_pixel[0]), int(hsv_pixel[1]), int(hsv_pixel[2])
+
+    # Low saturation = white/gray stripe band on striped balls, or near-white
+    # High saturation solid color
+    if s < 40:
+        # Could be a stripe (white band dominates the sample patch)
+        if brightness > 155:
+            return BallKind.STRIPE
+        return BallKind.CUE
+
+    # Hue-sector mapping (OpenCV H range: 0-179, half of standard 0-360)
+    # Red:    H < 10 or H > 165  (wraps around)
+    # Orange: H 10-20
+    # Yellow: H 18-38
+    # Green:  H 38-85
+    # Cyan:   H 85-100
+    # Blue:   H 100-130
+    # Purple: H 125-155
+    # Magenta:H 145-175
+
+    if h < 10 or h > 165:  # Red
+        if v < 110:
+            return BallKind.SOLID   # dark red / maroon (7-ball or 15-ball)
+        return BallKind.SOLID       # bright red (3-ball or 11-ball)
+    elif h < 22:  # Orange
+        return BallKind.SOLID       # 5-ball or 13-ball
+    elif h < 40:  # Yellow
+        return BallKind.SOLID       # 1-ball or 9-ball (was misclassified as STRIPE)
+    elif h < 85:  # Green
+        return BallKind.SOLID       # 6-ball or 14-ball
+    elif h < 100:  # Cyan (not a standard ball color — likely table cloth leak)
+        return BallKind.UNKNOWN
+    elif h < 130:  # Blue
+        return BallKind.SOLID       # 2-ball or 10-ball
+    elif h < 158:  # Purple
+        return BallKind.SOLID       # 4-ball or 12-ball
+    else:  # Magenta / pink
         return BallKind.STRIPE
+
     return BallKind.SOLID
